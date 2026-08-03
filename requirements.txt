@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+google-genai>=1.51.0,<2.0.0
+python-dotenv==1.0.1
+pytest==8.3.3
+httpx>=0.28.1,<1.0.0
