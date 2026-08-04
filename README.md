@@ -2,65 +2,61 @@
 
 **Jeol** is derived from the Korean word *jeollyak* (절약), meaning thrift or economizing. JeolAI demonstrates that enterprise AI agents should optimize for cost, not just capability.
 
-JeolAI is an AI shopping agent with a production-oriented control plane around it. The application traces model and tool calls, estimates session cost, routes requests between Gemini models, reduces work as spend rises, and requires human approval before a gated checkout.
+JeolAI is a cost-aware AI shopping agent with a production-oriented control plane. It combines a React + Vite experience, a FastAPI orchestration backend, Gemini on Vertex AI, deterministic commerce tools, budget-aware model routing, human approval, guardrails, and an observable execution timeline.
 
-The commerce domain is intentionally small. The engineering value is in the controls, not the size of the storefront.
+The commerce domain is intentionally bounded. The engineering value is in the controls, not the size of the storefront.
 
 ## What JeolAI demonstrates
 
 - Gemini function calling through Vertex AI
+- React + Vite two-panel application
+- FastAPI orchestration APIs
 - Deterministic catalog, inventory, promotion, cart, and checkout tools
+- Multi-step tool orchestration for budget-constrained shopping requests
 - Per-call token, cost, and latency tracing
-- Session-level budget accounting
-- Budget-aware model routing
-- Search-result reduction after a warning threshold
-- Human approval before a gated checkout
-- FastAPI APIs and a lightweight browser interface
-- GitHub Actions validation
-- Engineering documentation covering architecture, deployment, testing, and governance
+- Session-level budget accounting and model routing
+- Retrieval reduction after the warning threshold
+- Human approval before gated checkout
+- Pre-model domain guardrails
+- Session summaries with conversation and operating metrics
+- Pytest and Playwright validation
+- GitHub Actions and dependency auditing
+- Docker-based backend and frontend builds
 
 ## Architecture
 
 ```text
 User
   |
-Browser UI
+React + Vite UI
   |
 FastAPI API
   |
-Gemini Agent on Vertex AI
-  |-------------------------------|
-  |          |          |         |
-Catalog   Inventory  Promotions  Cart/Checkout
+Domain Guard
   |
 Budget Policy Engine
+  |
+Gemini Agent on Vertex AI
+  |-----------------------------------|
+  |            |           |          |
+Catalog     Inventory   Promotions   Cart/Checkout
   |
 Trace and Cost Store
   |
 SQLite
 ```
 
-The agent does not access the database directly. It can only act through the declared tools. The application intercepts tool requests, records execution telemetry, and enforces approval policy before checkout.
-
-## Demo app
-Backend:
-![Screenshot](/docs/Screenshot%202026-08-03%20at%201.05.57 AM.png)
-
-
-Frontend:
-![Screenshot](/docs/Screenshot%202026-08-03%20at%2012.58.59 AM.png)
-
-
+Gemini does not access the database directly. It may request only declared tools. The FastAPI backend validates tool requests, records telemetry, applies policy, and can pause checkout for human approval.
 
 ## Budget policy
 
 | Session spend | Model policy | Retrieval policy | Checkout policy |
 |---|---|---|---|
 | Below 70% | Default or escalated model | Full results | Customer confirmation |
-| 70% to 95% | Lower-cost default model | Results capped | Customer confirmation |
-| 95% or above | Lower-cost default model | Results capped | Human approval required |
+| 70% to 95% | Lower-cost model | Results capped | Customer confirmation |
+| 95% or above | Lower-cost model | Results capped | Human approval required |
 
-Thresholds, model names, and estimated token rates are configurable through environment variables.
+Thresholds, model names, and estimated token rates are configurable in `.env`.
 
 ## Repository structure
 
@@ -70,94 +66,162 @@ Thresholds, model names, and estimated token rates are configurable through envi
 │   ├── budget.py
 │   ├── db.py
 │   ├── gemini_client.py
+│   ├── guardrails.py
 │   ├── main.py
 │   ├── tools.py
 │   └── tracer.py
-├── docs/
-│   ├── architecture.md
-│   ├── deployment.md
-│   ├── governance.md
-│   ├── system-design.md
-│   └── testing-strategy.md
 ├── frontend/
-│   └── index.html
+│   ├── src/
+│   │   ├── App.jsx
+│   │   ├── api.js
+│   │   ├── main.jsx
+│   │   └── styles.css
+│   ├── package.json
+│   └── vite.config.js
+├── docs/
 ├── tests/
-├── .github/workflows/ci.yml
-├── .env.example
+├── e2e/
+├── .github/workflows/
+├── Dockerfile
+├── docker-compose.yml
+├── package.json
+├── playwright.config.js
 └── requirements.txt
 ```
-
-## Engineering documentation
-
-- [Architecture](docs/architecture.md): components, execution flow, trust boundaries, and tradeoffs
-- [System design](docs/system-design.md): requirements, APIs, data model, reliability, and scaling path
-- [Deployment](docs/deployment.md): local setup, Vertex AI authentication, CI, and production deployment
-- [Testing strategy](docs/testing-strategy.md): unit, integration, end-to-end, agent, and policy testing
-- [Governance](docs/governance.md): cost, approval, auditability, security, and operational ownership
 
 ## Prerequisites
 
 - Python 3.11 or later
-- A Google Cloud project with Vertex AI enabled
+- Node.js 20 or later
+- Google Cloud CLI
+- A Google Cloud project with billing and Vertex AI enabled
 - Permission to invoke the configured Gemini models
-- Google Cloud CLI for local Application Default Credentials
 
 ## Local setup
 
+### 1. Configure Google Cloud
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Set GOOGLE_CLOUD_PROJECT and review model and pricing configuration.
-
+gcloud auth login
 gcloud auth application-default login
+gcloud config set project YOUR_PROJECT_ID
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+gcloud services enable aiplatform.googleapis.com
 ```
 
-Start the API:
+### 2. Configure and run the backend
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# Set GOOGLE_CLOUD_PROJECT in .env
 uvicorn backend.main:app --reload --port 8000
 ```
 
-Open `frontend/index.html` in a browser. The page calls `http://localhost:8000`.
+Verify:
+
+```text
+http://127.0.0.1:8000/health
+http://127.0.0.1:8000/docs
+```
+
+### 3. Configure and run the React frontend
+
+```bash
+cd frontend
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Open:
+
+```text
+http://127.0.0.1:5500
+```
+
+The React application reads the backend address from:
+
+```text
+VITE_API_BASE_URL=http://127.0.0.1:8000
+```
 
 ## API endpoints
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /chat` | Run one user turn through the agent |
+| `POST /chat` | Run one user turn through guardrails, policy, Gemini, and tools |
 | `POST /approve` | Approve or deny a gated checkout |
 | `GET /budget-status/{session_id}` | Read current spend and policy tier |
-| `GET /trace/{session_id}` | Retrieve model, tool, cost, and latency events |
-| `POST /debug/set-spend` | Demonstrate budget thresholds locally |
-| `GET /health` | Verify service and model configuration |
+| `GET /trace/{session_id}` | Retrieve model, tool, cost, policy, and latency events |
+| `POST /debug/set-spend` | Demonstrate budget tiers locally |
+| `POST /end-chat` | Generate a resumable session summary |
+| `DELETE /session/{session_id}` | Reset a local workshop session |
+| `GET /health` | Verify provider and model configuration |
 
-## Authentication and cost notes
+## Testing
 
-The project uses the Google Gen AI SDK with Vertex AI and Application Default Credentials. No API key is stored in the repository.
+Backend tests do not require live Vertex AI calls:
 
-Displayed dollar amounts are estimates. Model prices can change and can differ by model, capability, and region. Update the rate variables in `.env` before using cost data for operational or financial decisions.
+```bash
+source venv/bin/activate
+pytest
+```
 
-## CI
+React build validation:
 
-GitHub Actions runs on pushes and pull requests to `main` or `master`. It installs dependencies, checks formatting and lint rules, runs tests, and validates Python compilation.
+```bash
+cd frontend
+npm ci
+npm run build
+```
 
-## Current scope and production gaps
+Playwright tests mock API responses and do not consume Gemini quota:
 
-This repository is a reference implementation, not a production commerce system. A production deployment would additionally require:
+```bash
+npm install
+npm --prefix frontend install
+npx playwright install chromium
+npm run test:e2e
+```
 
-- Identity, authentication, RBAC, and tenant isolation
-- Durable encrypted session and approval state
-- A managed transactional database
-- Idempotency for state-changing tools
-- Payment-provider isolation and reconciliation
-- Prompt, model, tool, and policy versioning
-- Golden datasets and continuous agent evaluation
-- Centralized logs, metrics, traces, and alerting
-- Organization-level budgets and chargeback
-- Security review, abuse controls, and incident runbooks
+## CI and security
+
+GitHub Actions validates:
+
+- Python compilation
+- Ruff linting
+- Pytest and backend coverage
+- React production build
+- Playwright UI workflows
+- Python dependency vulnerabilities through `pip-audit`
+- Weekly Python and GitHub Actions updates through Dependabot
+
+Normal pull requests do not authenticate to Google Cloud or invoke Gemini.
+
+## Docker
+
+Build and run the backend and frontend:
+
+```bash
+docker compose up --build
+```
+
+The local Docker configuration is for development and demonstration. A production deployment should use managed identity, durable storage, restricted CORS, and a managed database.
+
+## Engineering documentation
+
+- [Architecture](docs/architecture.md)
+- [System design](docs/system-design.md)
+- [Deployment](docs/deployment.md)
+- [Testing strategy](docs/testing-strategy.md)
+- [Governance](docs/governance.md)
+
+## Production gaps
+
+This repository is a reference implementation. A production deployment additionally requires identity, RBAC, tenant isolation, durable encrypted state, idempotency, payment isolation, centralized telemetry, continuous agent evaluation, prompt and policy versioning, organization-level budgets, security review, and incident runbooks.
 
 ## License
 
