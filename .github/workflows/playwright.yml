@@ -1,4 +1,4 @@
-name: Playwright UI Tests
+name: Playwright Workflow
 
 on:
   push:
@@ -12,18 +12,26 @@ permissions:
 
 jobs:
   playwright:
+    name: Playwright UI Tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
           cache: npm
-      - run: npm install
-      - run: npm --prefix frontend install
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm ci --prefix frontend
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
