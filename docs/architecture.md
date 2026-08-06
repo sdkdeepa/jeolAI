@@ -26,6 +26,8 @@ JeolAI is a reference implementation for operating an AI shopping agent under ex
 
 The model does not receive database credentials and cannot execute arbitrary code. It can only request functions declared by the application. The backend validates, executes, traces, and may block those requests.
 
+![JeolAI System Deign](/docs/jeolai-system-design.png)
+
 ## Major components
 
 ### React + Vite two-panel interface
