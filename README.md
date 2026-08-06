@@ -2,7 +2,7 @@
 
 **A cost-aware AI shopping agent that demonstrates how production AI applications can govern model use, tool execution, spending, and human approval.**
 
-JeolAI combines a React + Vite interface, a FastAPI orchestration backend, Gemini on Vertex AI, deterministic commerce tools, budget-aware model routing, guardrails, execution tracing, and approval-gated checkout.
+JeolAI combines a **React + Vite interface, a FastAPI orchestration backend, Gemini on Vertex AI**, deterministic commerce tools, budget-aware model routing, guardrails, execution tracing, and approval-gated checkout.
 
 The shopping domain is intentionally bounded. The engineering value is in the control plane around the model.
 

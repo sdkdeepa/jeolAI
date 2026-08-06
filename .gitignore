@@ -1,17 +1,23 @@
-.env
-data/shop_agent.db
-.DS_Store
-!data/.gitkeep
-venv/
-.venv/
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.coverage
-coverage.xml
-htmlcov/
+.venv/
+.env
+
+# Database
+data/*.db
+
+# Node
 node_modules/
 frontend/node_modules/
-frontend/dist/
+
+# Playwright
 playwright-report/
 test-results/
+
+# Coverage
+coverage.xml
+.pytest_cache/
+
+# OS
+.DS_Store
