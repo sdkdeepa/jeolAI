@@ -368,7 +368,24 @@ A production deployment would additionally require:
 
 ---
 
-## Workshop use
+## Application Screenshots: 
+
+#### Check the backend first:
+
+![Check Backend first](/docs/Backend.png)
+
+---
+#### Start with normal tier, then switch todowngraded tier.
+
+![Downgraded tier](/docs/Downgraded.png)
+
+---
+![Gated tier](/docs/Gated.png)
+
+---
+![Governance](/docs/Governance.png)
+
+---
 
 JeolAI was designed for a hands-on workshop that teaches the system around the model:
 
