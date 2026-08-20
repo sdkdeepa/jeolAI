@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "shop_agent.db"
-CATALOG_VERSION = "2026-08-rich-outdoor-v2"
+CATALOG_VERSION = "2026-08-rich-outdoor-v3-variants"
 
 # sku, name, brand, category, subcategory, gender, price, description, stock,
 # sizes, colors, tags
@@ -99,12 +99,14 @@ def init_db() -> None:
             sku TEXT, name TEXT NOT NULL, brand TEXT,
             category TEXT NOT NULL, subcategory TEXT, gender TEXT,
             price_usd REAL NOT NULL, description TEXT NOT NULL, stock INTEGER NOT NULL,
-            sizes_json TEXT, colors_json TEXT, tags_json TEXT
+            requires_size INTEGER NOT NULL DEFAULT 0, sizes_json TEXT, size_inventory_json TEXT,
+            colors_json TEXT, tags_json TEXT
         )
     """)
     for col, ddl in [
         ("sku", "TEXT"), ("brand", "TEXT"), ("subcategory", "TEXT"),
-        ("gender", "TEXT"), ("sizes_json", "TEXT"), ("colors_json", "TEXT"),
+        ("gender", "TEXT"), ("requires_size", "INTEGER NOT NULL DEFAULT 0"),
+        ("sizes_json", "TEXT"), ("size_inventory_json", "TEXT"), ("colors_json", "TEXT"),
         ("tags_json", "TEXT")
     ]:
         _add_column(cur, "products", col, ddl)
@@ -122,9 +124,10 @@ def init_db() -> None:
     cur.execute("""
         CREATE TABLE IF NOT EXISTS cart_items (
             session_id TEXT NOT NULL, product_name TEXT NOT NULL, quantity INTEGER NOT NULL,
-            PRIMARY KEY (session_id, product_name)
+            selected_size TEXT, PRIMARY KEY (session_id, product_name)
         )
     """)
+    _add_column(cur, "cart_items", "selected_size", "TEXT")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
@@ -156,12 +159,27 @@ def init_db() -> None:
     if row is None or row["value"] != CATALOG_VERSION:
         cur.execute("DELETE FROM products")
         cur.execute("DELETE FROM promotions")
+        product_rows = []
+        for product in SEED_PRODUCTS:
+            sizes = product[-3]
+            requires_size = bool(sizes)
+            size_inventory = {str(size): product[8] for size in sizes}
+            product_rows.append(
+                product[:-3]
+                + (
+                    int(requires_size),
+                    json.dumps(sizes),
+                    json.dumps(size_inventory),
+                    json.dumps(product[-2]),
+                    json.dumps(product[-1]),
+                )
+            )
         cur.executemany("""
             INSERT INTO products
             (sku, name, brand, category, subcategory, gender, price_usd, description, stock,
-             sizes_json, colors_json, tags_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [p[:-3] + (json.dumps(p[-3]), json.dumps(p[-2]), json.dumps(p[-1])) for p in SEED_PRODUCTS])
+             requires_size, sizes_json, size_inventory_json, colors_json, tags_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, product_rows)
         cur.executemany("""
             INSERT INTO promotions
             (code, category, subcategory, discount_pct, description, active)
@@ -179,7 +197,10 @@ def _normalize(value: str | None) -> str:
 
 def _product_dict(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
+    item["requires_size"] = bool(item.get("requires_size"))
     item["sizes"] = json.loads(item.pop("sizes_json") or "[]")
+    item["size_inventory"] = json.loads(item.pop("size_inventory_json") or "{}")
+    item["one_size"] = not item["requires_size"]
     item["colors"] = json.loads(item.pop("colors_json") or "[]")
     item["tags"] = json.loads(item.pop("tags_json") or "[]")
     return item
@@ -273,20 +294,47 @@ def resolve_product(product_name: str) -> dict[str, Any] | None:
     return scored[0][1] if scored and scored[0][0] >= 0.48 else None
 
 
+def _canonical_size(product: dict[str, Any], requested_size: str | None) -> str | None:
+    if requested_size is None:
+        return None
+    requested = _normalize(requested_size)
+    for size in product["sizes"]:
+        if _normalize(str(size)) == requested:
+            return str(size)
+    return None
+
+
+def _available_sizes(product: dict[str, Any]) -> list[str]:
+    inventory = product.get("size_inventory") or {}
+    return [str(size) for size in product["sizes"] if int(inventory.get(str(size), 0)) > 0]
+
+
 def check_inventory(product_name: str, size: str | None = None) -> dict[str, Any]:
     p = resolve_product(product_name)
     if not p:
         return {"found": False, "error": f"No catalog product closely matches '{product_name}'."}
-    size_available = True
-    if size and p["sizes"]:
-        size_available = _normalize(size) in {_normalize(s) for s in p["sizes"]}
+    available_sizes = _available_sizes(p)
+    canonical_size = _canonical_size(p, size)
+    if p["requires_size"]:
+        size_available = canonical_size is not None and canonical_size in available_sizes if size else None
+        in_stock = bool(available_sizes) if size is None else bool(size_available)
+    else:
+        size_available = True
+        in_stock = p["stock"] > 0
     return {
-        "found": True, "matched_product": p["name"], "sku": p["sku"],
-        "stock": p["stock"], "in_stock": p["stock"] > 0 and size_available,
-        "requested_size": size, "size_available": size_available,
-        "available_sizes": p["sizes"], "price_usd": p["price_usd"],
+        "found": True,
+        "matched_product": p["name"],
+        "sku": p["sku"],
+        "stock": p["stock"],
+        "in_stock": in_stock,
+        "requires_size": p["requires_size"],
+        "one_size": p["one_size"],
+        "requested_size": size,
+        "selected_size": canonical_size,
+        "size_available": size_available,
+        "available_sizes": available_sizes,
+        "price_usd": p["price_usd"],
     }
-
 
 def get_promotions(category: str | None = None, subcategory: str | None = None, product_name: str | None = None) -> list[dict[str, Any]]:
     if product_name:
@@ -311,54 +359,564 @@ def _best_promotion(category: str, subcategory: str | None = None) -> dict[str, 
     return max(promos, key=lambda p: p["discount_pct"], default=None)
 
 
-def update_cart(session_id: str, product_name: str, quantity: int, action: str = "add") -> dict[str, Any]:
+def update_cart(
+    session_id: str,
+    product_name: str,
+    quantity: int,
+    action: str = "add",
+    size: str | None = None,
+) -> dict[str, Any]:
     p = resolve_product(product_name)
+
     if not p:
-        return {"success": False, "error": f"No catalog product closely matches '{product_name}'."}
-    conn = get_connection(); cur = conn.cursor()
-    cur.execute("SELECT quantity FROM cart_items WHERE session_id=? AND product_name=?", (session_id, p["name"]))
-    row = cur.fetchone(); current = row["quantity"] if row else 0
-    new_qty = current + quantity if action == "add" else max(current - quantity, 0) if action == "remove" else quantity
-    if new_qty > p["stock"]:
-        conn.close(); return {"success": False, "error": f"Only {p['stock']} units of {p['name']} are available."}
-    if new_qty <= 0:
-        cur.execute("DELETE FROM cart_items WHERE session_id=? AND product_name=?", (session_id, p["name"]))
-    elif row:
-        cur.execute("UPDATE cart_items SET quantity=? WHERE session_id=? AND product_name=?", (new_qty, session_id, p["name"]))
+        return {
+            "success": False,
+            "status": "not_found",
+            "error": (
+                f"No catalog product closely matches "
+                f"'{product_name}'."
+            ),
+        }
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT quantity, selected_size
+        FROM cart_items
+        WHERE session_id=?
+          AND product_name=?
+        """,
+        (
+            session_id,
+            p["name"],
+        ),
+    )
+
+    row = cur.fetchone()
+
+    current = (
+        row["quantity"]
+        if row
+        else 0
+    )
+
+    current_size = (
+        row["selected_size"]
+        if row
+        else None
+    )
+
+    if action == "add":
+        new_qty = current + quantity
+    elif action == "remove":
+        new_qty = max(
+            current - quantity,
+            0,
+        )
     else:
-        cur.execute("INSERT INTO cart_items(session_id,product_name,quantity) VALUES(?,?,?)", (session_id, p["name"], new_qty))
-    conn.commit(); conn.close()
-    return {"success": True, "matched_product": p["name"], "cart": get_cart(session_id)}
+        new_qty = quantity
 
+    selected_size = (
+        _canonical_size(
+            p,
+            size,
+        )
+        if size is not None
+        else None
+    )
 
-def get_cart(session_id: str) -> list[dict[str, Any]]:
-    conn = get_connection(); cur = conn.cursor()
-    cur.execute("""
-        SELECT c.product_name, c.quantity, p.price_usd, p.category, p.subcategory
-        FROM cart_items c JOIN products p ON p.name=c.product_name
-        WHERE c.session_id=? ORDER BY c.product_name
-    """, (session_id,))
-    rows = [dict(r) for r in cur.fetchall()]; conn.close()
-    for row in rows:
-        row["line_total_usd"] = round(row["price_usd"] * row["quantity"], 2)
-    return rows
+    if (
+        p["requires_size"]
+        and new_qty > 0
+        and action in {
+            "add",
+            "set",
+        }
+    ):
+        available_sizes = (
+            _available_sizes(p)
+        )
 
+        if size is None:
+            conn.close()
 
-def checkout(session_id: str) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "needs_input",
+                "missing_fields": [
+                    "size"
+                ],
+                "matched_product": p["name"],
+                "available_sizes": (
+                    available_sizes
+                ),
+                "message": (
+                    "A size is required before "
+                    "this item can be added "
+                    "to the cart."
+                ),
+            }
+
+        if selected_size is None:
+            conn.close()
+
+            return {
+                "success": False,
+                "status": "invalid_variant",
+                "matched_product": p["name"],
+                "requested_size": size,
+                "available_sizes": (
+                    available_sizes
+                ),
+                "message": (
+                    f"Size {size} is not a valid "
+                    f"option for {p['name']}."
+                ),
+            }
+
+        variant_stock = int(
+            (
+                p.get(
+                    "size_inventory"
+                )
+                or {}
+            ).get(
+                selected_size,
+                0,
+            )
+        )
+
+        if variant_stock <= 0:
+            conn.close()
+
+            return {
+                "success": False,
+                "status": "out_of_stock",
+                "matched_product": p["name"],
+                "requested_size": (
+                    selected_size
+                ),
+                "available_sizes": (
+                    available_sizes
+                ),
+                "message": (
+                    f"Size {selected_size} is "
+                    "currently out of stock for "
+                    f"{p['name']}."
+                ),
+            }
+
+        if (
+            row
+            and current_size
+            and current_size
+            != selected_size
+            and action == "add"
+        ):
+            conn.close()
+
+            return {
+                "success": False,
+                "status": "variant_conflict",
+                "matched_product": p["name"],
+                "selected_size": (
+                    current_size
+                ),
+                "requested_size": (
+                    selected_size
+                ),
+                "message": (
+                    "This demo cart supports "
+                    "one size per product line. "
+                    "Remove the existing line "
+                    "before choosing another size."
+                ),
+            }
+
+        if new_qty > variant_stock:
+            conn.close()
+
+            return {
+                "success": False,
+                "status": "out_of_stock",
+                "error": (
+                    f"Only {variant_stock} units "
+                    f"of {p['name']} size "
+                    f"{selected_size} are available."
+                ),
+            }
+
+    elif not p["requires_size"]:
+        selected_size = None
+
+    if new_qty > p["stock"]:
+        conn.close()
+
+        return {
+            "success": False,
+            "status": "out_of_stock",
+            "error": (
+                f"Only {p['stock']} units of "
+                f"{p['name']} are available."
+            ),
+        }
+
+    if new_qty <= 0:
+        cur.execute(
+            """
+            DELETE FROM cart_items
+            WHERE session_id=?
+              AND product_name=?
+            """,
+            (
+                session_id,
+                p["name"],
+            ),
+        )
+
+    elif row:
+        final_size = (
+            selected_size
+            if selected_size is not None
+            else current_size
+        )
+
+        cur.execute(
+            """
+            UPDATE cart_items
+            SET quantity=?,
+                selected_size=?
+            WHERE session_id=?
+              AND product_name=?
+            """,
+            (
+                new_qty,
+                final_size,
+                session_id,
+                p["name"],
+            ),
+        )
+
+    else:
+        cur.execute(
+            """
+            INSERT INTO cart_items(
+                session_id,
+                product_name,
+                quantity,
+                selected_size
+            )
+            VALUES(?,?,?,?)
+            """,
+            (
+                session_id,
+                p["name"],
+                new_qty,
+                selected_size,
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
     cart = get_cart(session_id)
+
+    return {
+        "success": True,
+        "status": "updated",
+        "matched_product": p["name"],
+        "selected_size": (
+            selected_size
+            if selected_size is not None
+            else current_size
+        ),
+        "cart": cart,
+        "subtotal_usd": cart[
+            "subtotal_usd"
+        ],
+    }
+
+
+def get_cart(
+    session_id: str,
+) -> dict[str, Any]:
+    """
+    Return the current cart plus a deterministic subtotal.
+
+    Commerce totals are calculated here rather than by the LLM.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            c.product_name,
+            c.quantity,
+            c.selected_size,
+            p.price_usd,
+            p.category,
+            p.subcategory,
+            p.requires_size,
+            p.sizes_json,
+            p.size_inventory_json
+        FROM cart_items c
+        JOIN products p
+          ON p.name = c.product_name
+        WHERE c.session_id=?
+        ORDER BY c.product_name
+        """,
+        (session_id,),
+    )
+
+    rows = [
+        dict(row)
+        for row in cur.fetchall()
+    ]
+
+    conn.close()
+
+    for row in rows:
+        row["requires_size"] = bool(
+            row["requires_size"]
+        )
+
+        sizes = json.loads(
+            row.pop(
+                "sizes_json"
+            )
+            or "[]"
+        )
+
+        size_inventory = json.loads(
+            row.pop(
+                "size_inventory_json"
+            )
+            or "{}"
+        )
+
+        row["available_sizes"] = [
+            str(size)
+            for size in sizes
+            if int(
+                size_inventory.get(
+                    str(size),
+                    0,
+                )
+            )
+            > 0
+        ]
+
+        row["line_total_usd"] = round(
+            float(
+                row["price_usd"]
+            )
+            * int(
+                row["quantity"]
+            ),
+            2,
+        )
+
+    subtotal = round(
+        sum(
+            item[
+                "line_total_usd"
+            ]
+            for item in rows
+        ),
+        2,
+    )
+
+    return {
+        "items": rows,
+        "item_count": sum(
+            int(
+                item["quantity"]
+            )
+            for item in rows
+        ),
+        "subtotal_usd": subtotal,
+    }
+
+
+def checkout(
+    session_id: str,
+) -> dict[str, Any]:
+    cart_result = get_cart(
+        session_id
+    )
+
+    cart = cart_result[
+        "items"
+    ]
+
     if not cart:
-        return {"success": False, "error": "Cart is empty"}
-    subtotal = round(sum(i["line_total_usd"] for i in cart), 2)
-    best = None
+        return {
+            "success": False,
+            "status": "invalid_cart",
+            "error": "Cart is empty",
+        }
+
+    # Defense in depth:
+    # checkout independently validates
+    # every required product variant.
     for item in cart:
-        promo = _best_promotion(item["category"], item["subcategory"])
-        if promo and (best is None or promo["discount_pct"] > best["discount_pct"]):
+        if (
+            item["requires_size"]
+            and not item.get(
+                "selected_size"
+            )
+        ):
+            return {
+                "success": False,
+                "status": "invalid_cart",
+                "error": (
+                    f"{item['product_name']} "
+                    "requires a size before "
+                    "checkout."
+                ),
+                "invalid_item": (
+                    item["product_name"]
+                ),
+                "missing_fields": [
+                    "size"
+                ],
+            }
+
+        if item["requires_size"]:
+            inventory = check_inventory(
+                item["product_name"],
+                item["selected_size"],
+            )
+
+            if not inventory.get(
+                "in_stock"
+            ):
+                return {
+                    "success": False,
+                    "status": "invalid_cart",
+                    "error": (
+                        "Selected size "
+                        f"{item['selected_size']} "
+                        "is unavailable for "
+                        f"{item['product_name']}."
+                    ),
+                    "invalid_item": (
+                        item["product_name"]
+                    ),
+                    "available_sizes": (
+                        inventory.get(
+                            "available_sizes",
+                            [],
+                        )
+                    ),
+                }
+
+    # Use the deterministic subtotal
+    # already calculated by get_cart().
+    subtotal = cart_result[
+        "subtotal_usd"
+    ]
+
+    best = None
+
+    for item in cart:
+        promo = _best_promotion(
+            item["category"],
+            item["subcategory"],
+        )
+
+        if (
+            promo
+            and (
+                best is None
+                or promo[
+                    "discount_pct"
+                ]
+                > best[
+                    "discount_pct"
+                ]
+            )
+        ):
             best = promo
-    discount = round(subtotal * ((best or {}).get("discount_pct", 0) / 100), 2)
-    total = round(subtotal - discount, 2)
-    conn = get_connection(); cur = conn.cursor()
-    cur.execute("INSERT INTO orders(session_id,items_json,subtotal_usd,discount_usd,total_usd,promo_code) VALUES(?,?,?,?,?,?)",
-                (session_id, json.dumps(cart), subtotal, discount, total, best["code"] if best else None))
-    cur.execute("DELETE FROM cart_items WHERE session_id=?", (session_id,)); conn.commit(); order_id = cur.lastrowid; conn.close()
-    return {"success": True, "order_id": order_id, "items": cart, "subtotal_usd": subtotal,
-            "discount_usd": discount, "total_usd": total, "promo_code": best["code"] if best else None}
+
+    discount_pct = (
+        (best or {}).get(
+            "discount_pct",
+            0,
+        )
+    )
+
+    discount = round(
+        subtotal
+        * (
+            discount_pct
+            / 100
+        ),
+        2,
+    )
+
+    total = round(
+        subtotal - discount,
+        2,
+    )
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO orders(
+            session_id,
+            items_json,
+            subtotal_usd,
+            discount_usd,
+            total_usd,
+            promo_code
+        )
+        VALUES(?,?,?,?,?,?)
+        """,
+        (
+            session_id,
+            json.dumps(cart),
+            subtotal,
+            discount,
+            total,
+            (
+                best["code"]
+                if best
+                else None
+            ),
+        ),
+    )
+
+    cur.execute(
+        """
+        DELETE FROM cart_items
+        WHERE session_id=?
+        """,
+        (session_id,),
+    )
+
+    conn.commit()
+
+    order_id = cur.lastrowid
+
+    conn.close()
+
+    return {
+        "success": True,
+        "status": "completed",
+        "order_id": order_id,
+        "items": cart,
+        "subtotal_usd": subtotal,
+        "discount_usd": discount,
+        "total_usd": total,
+        "promo_code": (
+            best["code"]
+            if best
+            else None
+        ),
+    }

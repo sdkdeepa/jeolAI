@@ -26,7 +26,13 @@ def execute_tool(name: str, tool_input: dict, session_id: str) -> dict:
             product_name=tool_input.get("product_name"),
         )}
     if name == "update_cart":
-        return db.update_cart(session_id, tool_input["product_name"], int(tool_input.get("quantity", 1)), tool_input.get("action", "add"))
+        return db.update_cart(
+            session_id,
+            tool_input["product_name"],
+            int(tool_input.get("quantity", 1)),
+            tool_input.get("action", "add"),
+            tool_input.get("size"),
+        )
     if name == "get_cart":
         return {"cart": db.get_cart(session_id)}
     if name == "checkout":
