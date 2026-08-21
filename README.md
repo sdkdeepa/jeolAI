@@ -190,7 +190,19 @@ This policy is intentionally simple enough for a workshop while still illustrati
 
 ## Local setup
 
-### 1. Configure Google Cloud
+### 1. Clone and install dependencies
+
+From a terminal, clone JeolAI and run the root setup command:
+
+```bash
+git clone https://github.com/sdkdeepa/jeolAI.git
+cd jeolAI
+npm run setup
+```
+
+`npm run setup` installs the backend Python dependencies, frontend Node dependencies, and the Chromium browser used by Playwright. You do not need to switch between the backend and frontend directories to install dependencies manually.
+
+### 2. Configure Google Cloud
 
 ```bash
 gcloud auth login
@@ -200,31 +212,20 @@ gcloud auth application-default set-quota-project YOUR_PROJECT_ID
 gcloud services enable aiplatform.googleapis.com
 ```
 
-### 2. Run the backend
+### 3. Configure environment variables
+
+Create the backend environment file:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
 cp .env.example .env
-# Set GOOGLE_CLOUD_PROJECT and model configuration in .env
-
-uvicorn backend.main:app --reload --port 8000
 ```
 
-Verify:
+Set `GOOGLE_CLOUD_PROJECT` and the required model configuration in `.env`.
 
-- `http://127.0.0.1:8000/health`
-- `http://127.0.0.1:8000/docs`
-
-### 3. Run the frontend
+Create the frontend environment file:
 
 ```bash
-cd frontend
-cp .env.example .env
-npm install
-npm run dev
+cp frontend/.env.example frontend/.env
 ```
 
 Set the backend address in `frontend/.env`:
@@ -233,7 +234,20 @@ Set the backend address in `frontend/.env`:
 VITE_API_BASE_URL=http://127.0.0.1:8000
 ```
 
-Open the URL printed by Vite.
+### 4. Start JeolAI
+
+From the repository root, start both the FastAPI backend and React frontend with one command:
+
+```bash
+npm start
+```
+
+Verify the backend at:
+
+- `http://127.0.0.1:8000/health`
+- `http://127.0.0.1:8000/docs`
+
+Open the frontend URL printed by Vite.
 
 ---
 

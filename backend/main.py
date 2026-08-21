@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,7 +16,16 @@ from backend import budget, db, tracer
 from backend.guardrails import evaluate_request
 from backend.gemini_client import resume_after_approval, run_turn, user_message
 
-app = FastAPI(title="JeolAI: Shop Smart, Spend Smarter")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init_db()
+    yield
+
+
+app = FastAPI(
+    title="JeolAI: Shop Smart, Spend Smarter",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,11 +40,6 @@ _conversations: dict[str, list[types.Content]] = {}
 _pending_approvals: dict[str, dict[str, Any]] = {}
 _chat_history: dict[str, list[dict[str, Any]]] = {}
 _session_started_at: dict[str, float] = {}
-
-
-@app.on_event("startup")
-def startup() -> None:
-    db.init_db()
 
 
 class ChatRequest(BaseModel):
@@ -86,6 +91,7 @@ def chat(req: ChatRequest):
     _session_started_at.setdefault(session_id, time.time())
 
     _append_history(session_id, "user", req.message)
+
     tracer.record_event(
         session_id,
         "Request received",
@@ -93,7 +99,11 @@ def chat(req: ChatRequest):
         step_type="request",
     )
 
-    guard = evaluate_request(req.message)
+    guard = evaluate_request(
+        req.message,
+        history=_chat_history.get(session_id, []),
+    )
+
     tracer.record_event(
         session_id,
         "Domain guard passed" if guard.allowed else "Domain guard blocked request",

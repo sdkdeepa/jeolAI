@@ -3,14 +3,24 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
+    "setup": "npm run frontend:install && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && npx playwright install chromium",
+
+    "backend": ".venv/bin/python -m uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000",
+    "frontend": "npm --prefix frontend run dev",
+    "start": "concurrently -n BACKEND,FRONTEND \"npm run backend\" \"npm run frontend\"",
+
+    "test:backend": "PYTHONPATH=. .venv/bin/python -m pytest -q",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:report": "playwright show-report",
+    "test": "npm run test:backend && npm run test:e2e",
+
     "frontend:install": "npm --prefix frontend install",
     "frontend:build": "npm --prefix frontend run build"
   },
   "devDependencies": {
-    "@playwright/test": "^1.54.0"
+    "@playwright/test": "^1.54.0",
+    "concurrently": "^9.2.0"
   }
 }
