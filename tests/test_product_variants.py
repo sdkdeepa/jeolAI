@@ -7,6 +7,9 @@ from backend import db
 
 @pytest.fixture(autouse=True)
 def clean_database():
+    # check if schema exists first
+    db.init_db()
+    
     conn = db.get_connection()
     conn.execute("DELETE FROM cart_items")
     conn.execute("DELETE FROM orders")
@@ -337,4 +340,3 @@ def test_checkout_rejects_variant_that_becomes_unavailable():
 
         conn.commit()
         conn.close()
-        
