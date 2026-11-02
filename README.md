@@ -417,4 +417,4 @@ Workshop-specific instructions can live separately from this engineering overvie
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
