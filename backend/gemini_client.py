@@ -489,6 +489,13 @@ def _response_text(response: Any) -> str:
     ]
     return "".join(texts).strip()
 
+    if (
+        not candidates
+        or candidates[0].content is None
+    ):
+        raise RuntimeError(
+            "Gemini returned no candidate content"
+        )
 
 def _latest_user_text(
     contents: list[types.Content],
