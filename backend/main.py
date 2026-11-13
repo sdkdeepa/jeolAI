@@ -12,9 +12,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from backend import config  # noqa: F401  (loads .env before other modules)
 from backend import budget, db, tracer
+from backend.gemini_client import (
+    close_pending_calls,
+    resume_after_approval,
+    run_turn,
+    user_message,
+)
 from backend.guardrails import evaluate_request
-from backend.gemini_client import resume_after_approval, run_turn, user_message
+
+APPROVAL_REPLY = (
+    "This checkout needs human approval because the session reached "
+    "its budget threshold. Approve or deny it to continue."
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -161,8 +172,35 @@ def chat(req: ChatRequest):
     )
 
     history = _conversations.setdefault(session_id, [])
-    history.append(user_message(req.message))
+    snapshot = len(history)
+
+    turn_message = user_message(req.message)
+    pending = _pending_approvals.pop(session_id, None)
+    if pending is not None:
+        # The user moved on without approving. Answer the open function calls
+        # in the same user turn; otherwise Gemini rejects the history.
+        turn_message.parts = close_pending_calls(
+            pending.get("calls") or [{"name": pending["function_name"], "args": {}}],
+            "Checkout was not approved before the user sent a new message.",
+        ) + list(turn_message.parts)
+        tracer.record_event(
+            session_id,
+            "Pending checkout approval closed by new message",
+            step_type="approval",
+        )
+
+    history.append(turn_message)
     result = run_turn(session_id, model, history)
+
+    if result["status"] == "error":
+        # Discard this turn entirely so the next request starts from the
+        # last valid conversation state. A pending approval that was closed
+        # above is restored as well.
+        del history[snapshot:]
+        if pending is not None:
+            _pending_approvals[session_id] = pending
+        result["messages"] = history
+
     _conversations[session_id] = result["messages"]
 
     status = budget.record_usage(
@@ -175,16 +213,14 @@ def chat(req: ChatRequest):
     if result["status"] == "needs_approval":
         _pending_approvals[session_id] = {
             "function_name": result["pending_function_name"],
+            "calls": result.get("pending_calls"),
             "model": model,
         }
-        reply = (
-            "This checkout needs human approval because the session reached "
-            "its budget threshold. Approve or deny it to continue."
-        )
+        reply = APPROVAL_REPLY
         requires_approval = True
     else:
         reply = result["text"]
-        requires_approval = False
+        requires_approval = session_id in _pending_approvals
 
     turn_latency_ms = round((time.perf_counter() - request_start) * 1000, 1)
     tracer.record_event(
@@ -215,6 +251,7 @@ def chat(req: ChatRequest):
         },
         "turn_latency_ms": turn_latency_ms,
         "budget": status.__dict__,
+        "model_error": result["status"] == "error",
     }
 
 
@@ -230,13 +267,14 @@ def approve(req: ApproveRequest):
         return {"error": "No pending approval for this session"}
 
     started = time.perf_counter()
-    messages = _conversations.get(req.session_id, [])
+    messages = _conversations.setdefault(req.session_id, [])
     result = resume_after_approval(
         req.session_id,
         pending["model"],
         messages,
         pending["function_name"],
         req.approved,
+        pending_calls=pending.get("calls"),
     )
     _conversations[req.session_id] = result["messages"]
     status = budget.record_usage(
@@ -245,10 +283,23 @@ def approve(req: ApproveRequest):
         result["input_tokens"],
         result["output_tokens"],
     )
+
+    if result["status"] == "needs_approval":
+        # The model asked for checkout again (for example after a denial).
+        _pending_approvals[req.session_id] = {
+            "function_name": result["pending_function_name"],
+            "calls": result.get("pending_calls"),
+            "model": pending["model"],
+        }
+        reply = APPROVAL_REPLY
+    else:
+        reply = result["text"]
+
     latency = round((time.perf_counter() - started) * 1000, 1)
-    _append_history(req.session_id, "assistant", result["text"], latency_ms=latency)
+    _append_history(req.session_id, "assistant", reply, latency_ms=latency)
     return {
-        "reply": result["text"],
+        "reply": reply,
+        "model_error": result["status"] == "error",
         "requires_approval": result["status"] == "needs_approval",
         "model_used": pending["model"],
         "tokens_this_turn": {
@@ -339,4 +390,6 @@ def health():
         "status": "ok",
         "provider": "Vertex AI",
         "models": [budget.DEFAULT_MODEL, budget.ESCALATION_MODEL],
+        "env_file_loaded": config.ENV_FILE_LOADED,
+        "defaulted_settings": config.defaulted_settings(),
     }

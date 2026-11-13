@@ -3,33 +3,44 @@
 Cost values are estimates based on configurable per-million-token rates. Set
 rates in the environment to match the current pricing for the selected Gemini
 models and deployment region.
+
+Output rates apply to response tokens AND thinking tokens: Google bills
+thinking tokens at the output rate. gemini_client._usage() therefore reports
+output_tokens = candidates_token_count + thoughts_token_count.
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
+# Importing config loads .env before any constant below is evaluated.
+from backend import config
 from backend.db import get_connection
 
-DEFAULT_MODEL = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash-lite")
-ESCALATION_MODEL = os.getenv("GEMINI_ESCALATION_MODEL", "gemini-2.5-flash")
+# The defaults below are only used when a variable is absent (for example in
+# CI, which has no .env). They mirror the documented .env so a missing file
+# cannot silently switch model families or pricing. /health reports any
+# setting that fell back to a default.
+DEFAULT_MODEL = config.get_str("GEMINI_DEFAULT_MODEL", "gemini-3.5-flash-lite")
+ESCALATION_MODEL = config.get_str("GEMINI_ESCALATION_MODEL", "gemini-3.5-flash")
 
+# Defaults match Google Cloud Vertex AI Standard PayGo, global endpoint, as
+# published in Nov 2026. Non-global (regional) endpoints are priced ~10% higher.
 MODEL_RATES = {
     DEFAULT_MODEL: {
-        "input": float(os.getenv("GEMINI_DEFAULT_INPUT_USD_PER_M", "0.10")),
-        "output": float(os.getenv("GEMINI_DEFAULT_OUTPUT_USD_PER_M", "0.40")),
+        "input": config.get_float("GEMINI_DEFAULT_INPUT_USD_PER_M", 0.30),
+        "output": config.get_float("GEMINI_DEFAULT_OUTPUT_USD_PER_M", 2.50),
     },
     ESCALATION_MODEL: {
-        "input": float(os.getenv("GEMINI_ESCALATION_INPUT_USD_PER_M", "0.30")),
-        "output": float(os.getenv("GEMINI_ESCALATION_OUTPUT_USD_PER_M", "2.50")),
+        "input": config.get_float("GEMINI_ESCALATION_INPUT_USD_PER_M", 1.50),
+        "output": config.get_float("GEMINI_ESCALATION_OUTPUT_USD_PER_M", 9.00),
     },
 }
 
-SESSION_BUDGET_USD = float(os.getenv("SESSION_BUDGET_USD", "0.10"))
-WARN_THRESHOLD = float(os.getenv("WARN_THRESHOLD", "0.70"))
-HARD_THRESHOLD = float(os.getenv("HARD_THRESHOLD", "0.95"))
-SEARCH_RESULT_CAP = int(os.getenv("SEARCH_RESULT_CAP", "3"))
+SESSION_BUDGET_USD = config.get_float("SESSION_BUDGET_USD", 0.10)
+WARN_THRESHOLD = config.get_float("WARN_THRESHOLD", 0.70)
+HARD_THRESHOLD = config.get_float("HARD_THRESHOLD", 0.95)
+SEARCH_RESULT_CAP = config.get_int("SEARCH_RESULT_CAP", 3)
 
 
 @dataclass

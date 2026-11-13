@@ -259,6 +259,13 @@ def evaluate_request(
             normalized,
         )
     )
+    # Accept simple plurals ("promotions", "discounts", "jackets") so that
+    # ordinary shopping questions are not rejected as off-domain.
+    words |= {
+        word[:-1]
+        for word in words
+        if len(word) > 3 and word.endswith("s")
+    }
 
     matches = sorted(
         words & _COMMERCE

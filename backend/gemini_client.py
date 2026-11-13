@@ -2,22 +2,30 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
-from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from backend import budget, tracer
+# config must be imported before reading any environment variable.
+from backend import budget, config, tracer  # noqa: F401
 from backend.tools import execute_tool
 
-load_dotenv()
+logger = logging.getLogger("jeolai.gemini")
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
-LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+LOCATION = config.get_str("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+# Number of times an empty model turn (no text, no function call) is retried
+# before the backend falls back to a deterministic response.
+EMPTY_RESPONSE_RETRIES = 1
+
+MAX_AGENT_STEPS = 8
 
 if not PROJECT_ID:
     raise RuntimeError("GOOGLE_CLOUD_PROJECT is required in .env")
@@ -220,31 +228,74 @@ def user_message(text: str) -> types.Content:
     )
 
 
-def _usage(response: Any) -> tuple[int, int]:
-    metadata = getattr(
-        response,
-        "usage_metadata",
-        None,
-    )
+def _usage_details(response: Any) -> dict[str, int]:
+    """Return the raw token counters Gemini reported for one call."""
+    metadata = getattr(response, "usage_metadata", None)
 
-    return (
-        int(
-            getattr(
-                metadata,
-                "prompt_token_count",
-                0,
-            )
-            or 0
-        ),
-        int(
-            getattr(
-                metadata,
-                "candidates_token_count",
-                0,
-            )
-            or 0
-        ),
-    )
+    def count(field: str) -> int:
+        return int(getattr(metadata, field, 0) or 0)
+
+    return {
+        "prompt_tokens": count("prompt_token_count"),
+        "tool_use_prompt_tokens": count("tool_use_prompt_token_count"),
+        "cached_prompt_tokens": count("cached_content_token_count"),
+        "candidates_tokens": count("candidates_token_count"),
+        "thoughts_tokens": count("thoughts_token_count"),
+        "total_tokens": count("total_token_count"),
+    }
+
+
+def _usage(response: Any) -> tuple[int, int]:
+    """
+    Return (billable_input_tokens, billable_output_tokens).
+
+    Google bills thinking tokens at the output rate, and Gemini reports them
+    separately in thoughts_token_count, not in candidates_token_count. Leaving
+    them out under-reports output spend for thinking models such as Gemini 3.5.
+
+    tool_use_prompt_token_count covers tokens added by built-in tools and is
+    billed as input. JeolAI uses only custom function declarations, so it is
+    normally 0.
+
+    Cached-input discounts are not modelled. JeolAI does not use explicit
+    context caching, so this remains an estimate.
+    """
+    details = _usage_details(response)
+    input_tokens = details["prompt_tokens"] + details["tool_use_prompt_tokens"]
+    output_tokens = details["candidates_tokens"] + details["thoughts_tokens"]
+    return input_tokens, output_tokens
+
+
+def _finish_reason(response: Any) -> str | None:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return None
+    reason = getattr(candidates[0], "finish_reason", None)
+    if reason is None:
+        return None
+    return getattr(reason, "name", None) or str(reason)
+
+
+def _part_has_payload(part: Any) -> bool:
+    """
+    True when a Part carries anything Gemini will accept.
+
+    An empty-text part that still carries a thought_signature is kept, because
+    Gemini 3 requires signatures to be returned exactly as received.
+    """
+    if part is None:
+        return False
+    if isinstance(part, types.Part):
+        return bool(part.model_dump(exclude_none=True))
+    return True
+
+
+def _valid_parts(content: Any) -> list[Any]:
+    return [
+        part
+        for part in (getattr(content, "parts", None) or [])
+        if _part_has_payload(part)
+    ]
 
 
 def _normalize_contents(
@@ -255,6 +306,10 @@ def _normalize_contents(
 
     JeolAI may internally represent assistant messages using the conventional
     "assistant" role. Gemini accepts "user" and "model".
+
+    Gemini rejects any Content with no parts ("must include at least one parts
+    field"). Such entries are dropped here as a last line of defence; the
+    agent loop also avoids storing them in history.
 
     Normalize only the copy sent to Gemini so application history does not
     need to change.
@@ -277,17 +332,15 @@ def _normalize_contents(
                 "Expected 'user' or 'model'."
             )
 
+        parts = _valid_parts(content)
+        if not parts:
+            logger.warning("Dropping %s content with no parts from Gemini request", role)
+            continue
+
         normalized.append(
             types.Content(
                 role=role,
-                parts=list(
-                    getattr(
-                        content,
-                        "parts",
-                        None,
-                    )
-                    or []
-                ),
+                parts=parts,
             )
         )
 
@@ -344,7 +397,9 @@ def _call_model(
         output_tokens,
         latency_ms,
         details={
-            "function_calls_requested": calls
+            "function_calls_requested": calls,
+            "finish_reason": _finish_reason(response),
+            "usage": _usage_details(response),
         },
     )
 
@@ -358,11 +413,19 @@ def _run_tool(
 ) -> dict:
     start = time.perf_counter()
 
-    result = execute_tool(
-        name,
-        tool_input,
-        session_id,
-    )
+    try:
+        result = execute_tool(
+            name,
+            tool_input,
+            session_id,
+        )
+    except Exception as exc:  # A tool bug must not abort the whole turn.
+        logger.exception("Tool %s failed", name)
+        result = {
+            "success": False,
+            "status": "tool_error",
+            "error": f"{name} failed: {type(exc).__name__}",
+        }
 
     tracer.record_tool_call(
         session_id,
@@ -381,7 +444,15 @@ def _run_tool(
 
 def _response_content(
     response: Any,
-) -> types.Content:
+) -> types.Content | None:
+    """
+    Return the model turn to store in history, or None if it is empty.
+
+    Gemini can return a candidate whose content has no parts (observed in
+    the failing session: 0 output tokens, no function call). Storing that in
+    history produced the 400 "must include at least one parts field" on every
+    later request.
+    """
     candidates = (
         getattr(
             response,
@@ -395,33 +466,36 @@ def _response_content(
         not candidates
         or candidates[0].content is None
     ):
+        return None
+
+    parts = _valid_parts(candidates[0].content)
+    if not parts:
+        return None
+
+    # Keep the original Part objects so thought signatures and function-call
+    # ordering are preserved exactly as Gemini returned them.
+    return types.Content(role="model", parts=parts)
+
+
+def _response_text(response: Any) -> str:
+    """Join non-thought text parts without triggering SDK warnings."""
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates or candidates[0].content is None:
+        return ""
+    texts = [
+        part.text
+        for part in (candidates[0].content.parts or [])
+        if getattr(part, "text", None) and not getattr(part, "thought", False)
+    ]
+    return "".join(texts).strip()
+
+    if (
+        not candidates
+        or candidates[0].content is None
+    ):
         raise RuntimeError(
             "Gemini returned no candidate content"
         )
-
-    content = candidates[0].content
-
-    role = getattr(
-        content,
-        "role",
-        None,
-    )
-
-    if role == "assistant":
-        return types.Content(
-            role="model",
-            parts=list(
-                getattr(
-                    content,
-                    "parts",
-                    None,
-                )
-                or []
-            ),
-        )
-
-    return content
-
 
 def _latest_user_text(
     contents: list[types.Content],
@@ -652,64 +726,160 @@ def _preplan_bundle(
     )
 
 
+_CART_REVIEW = re.compile(
+    r"\b(show|view|see|review|display|list|what(?:'s| is)?|whats)\b"
+    r"[^.?!]{0,40}\b(my |the )?cart\b"
+    r"|\bcart\b[^.?!]{0,20}\b(contents|status|total)\b"
+    r"|\bin (?:my|the) cart\b",
+    re.I,
+)
+
+
+def _is_cart_review_request(text: str) -> bool:
+    lowered = text.lower()
+    if re.search(r"\b(add|remove|delete|checkout|check out|buy|purchase)\b", lowered):
+        return False
+    return bool(_CART_REVIEW.search(text))
+
+
+def _format_money(value: Any) -> str:
+    return f"${float(value):,.2f}"
+
+
+def _format_cart(cart: dict[str, Any]) -> str:
+    """Deterministic cart summary built only from get_cart output."""
+    items = cart.get("items") or []
+    if not items:
+        return "Your cart is empty."
+
+    lines = ["Here is what is in your cart:"]
+    for item in items:
+        size = item.get("selected_size")
+        size_text = f", size {size}" if size else ""
+        lines.append(
+            f"- {item['product_name']}{size_text} × {item['quantity']}: "
+            f"{_format_money(item['line_total_usd'])}"
+        )
+    lines.append(f"Subtotal: {_format_money(cart.get('subtotal_usd', 0))}")
+    return "\n".join(lines)
+
+
+def _format_checkout(result: dict[str, Any]) -> str:
+    """Deterministic checkout summary built only from checkout output."""
+    if result.get("success"):
+        text = (
+            f"Order {result.get('order_id')} is complete. "
+            f"Subtotal {_format_money(result.get('subtotal_usd', 0))}, "
+            f"discount {_format_money(result.get('discount_usd', 0))}, "
+            f"total {_format_money(result.get('total_usd', 0))}."
+        )
+        if result.get("promo_code"):
+            text += f" Promotion applied: {result['promo_code']}."
+        return text
+    return f"Checkout was not completed: {result.get('error', 'unknown reason')}."
+
+
+@dataclass
+class TurnUsage:
+    """Accumulates billable tokens across every model call in one turn.
+
+    Kept outside the loop so tokens already spent are still charged to the
+    session budget when a later call in the same turn fails.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def add(self, response: Any) -> None:
+        input_tokens, output_tokens = _usage(response)
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+
+
+def _function_response_part(name: str, result: dict) -> types.Part:
+    return types.Part.from_function_response(
+        name=name,
+        response={"result": result},
+    )
+
+
+def _deterministic_fallback(
+    session_id: str,
+    contents: list[types.Content],
+) -> str:
+    """
+    Answer from deterministic tools when Gemini returns an empty turn.
+
+    For a cart-review request the backend calls get_cart itself, so the user
+    still gets the real cart state rather than a generic failure.
+    """
+    latest = _latest_user_text(contents)
+
+    if _is_cart_review_request(latest):
+        result = _run_tool(session_id, "get_cart", {})
+        tracer.record_event(
+            session_id,
+            "Deterministic cart fallback used after empty model response",
+            step_type="fallback",
+        )
+        return _format_cart(result.get("cart") or {})
+
+    return (
+        "I wasn't able to generate a response for that request. "
+        "Please try again or rephrase it."
+    )
+
+
 def _agent_loop(
     session_id: str,
     model: str,
     contents: list[types.Content],
+    usage: TurnUsage | None = None,
+    state: dict[str, Any] | None = None,
 ) -> dict:
-    total_input = 0
-    total_output = 0
+    usage = usage or TurnUsage()
+    state = state if state is not None else {}
+    empty_responses = 0
 
-    for _ in range(8):
+    for _ in range(MAX_AGENT_STEPS):
         response = _call_model(
             session_id,
             model,
             contents,
         )
+        usage.add(response)
 
-        input_tokens, output_tokens = _usage(
-            response
-        )
+        content = _response_content(response)
+        calls = list(response.function_calls or []) if content else []
+        text = _response_text(response) if content else ""
 
-        total_input += input_tokens
-        total_output += output_tokens
-
-        contents.append(
-            _response_content(response)
-        )
-
-        calls = list(
-            response.function_calls
-            or []
-        )
-
-        if not calls:
-            text = (
-                response.text
-                or (
-                    "I could not generate "
-                    "a grounded response."
-                )
-            )
-
+        if not calls and not text:
+            # Empty turn: do NOT store it in history.
+            empty_responses += 1
             tracer.record_event(
                 session_id,
-                "Agent produced final response",
+                "Gemini returned an empty response",
                 details={
-                    "response_preview": (
-                        text[:500]
-                    )
+                    "finish_reason": _finish_reason(response),
+                    "usage": _usage_details(response),
+                    "attempt": empty_responses,
                 },
-                step_type="final_response",
+                step_type="model_empty_response",
             )
 
-            return {
-                "status": "complete",
-                "text": text,
-                "messages": contents,
-                "input_tokens": total_input,
-                "output_tokens": total_output,
-            }
+            if empty_responses <= EMPTY_RESPONSE_RETRIES:
+                continue
+
+            text = _deterministic_fallback(session_id, contents)
+            contents.append(
+                types.Content(role="model", parts=[types.Part.from_text(text=text)])
+            )
+            return _complete(session_id, text, contents, usage, fallback=True)
+
+        contents.append(content)
+
+        if not calls:
+            return _complete(session_id, text, contents, usage)
 
         for call in calls:
             args = dict(
@@ -722,53 +892,53 @@ def _agent_loop(
                 args,
             )
 
-            if (
-                call.name == "checkout"
-                and budget.checkout_requires_approval(
-                    session_id
-                )
-            ):
-                tracer.record_event(
-                    session_id,
-                    (
-                        "Checkout paused "
-                        "for human approval"
-                    ),
-                    details={
-                        "budget_tier": "gated"
-                    },
-                    step_type="approval",
-                )
+        needs_approval = any(
+            call.name == "checkout" and not state.get("completed_checkout")
+            for call in calls
+        ) and budget.checkout_requires_approval(session_id)
 
-                return {
-                    "status": "needs_approval",
-                    "pending_function_name": (
-                        "checkout"
-                    ),
-                    "messages": contents,
-                    "input_tokens": total_input,
-                    "output_tokens": total_output,
-                }
+        if needs_approval:
+            tracer.record_event(
+                session_id,
+                (
+                    "Checkout paused "
+                    "for human approval"
+                ),
+                details={
+                    "budget_tier": "gated"
+                },
+                step_type="approval",
+            )
+
+            # Every function call in this model turn must get a response
+            # (Gemini rejects partial answers), so all of them are kept and
+            # executed together after the approval decision.
+            return {
+                "status": "needs_approval",
+                "pending_function_name": (
+                    "checkout"
+                ),
+                "pending_calls": [
+                    {"name": call.name, "args": dict(call.args or {})}
+                    for call in calls
+                ],
+                "messages": contents,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            }
 
         response_parts = []
 
         for call in calls:
-            result = _run_tool(
-                session_id,
-                call.name,
-                dict(
-                    call.args or {}
-                ),
-            )
+            args = dict(call.args or {})
+            if call.name == "checkout" and state.get("completed_checkout"):
+                result = _duplicate_checkout_result(state["completed_checkout"])
+            else:
+                result = _run_tool(session_id, call.name, args)
+                if call.name == "checkout" and result.get("success"):
+                    state["completed_checkout"] = result
 
-            response_parts.append(
-                types.Part.from_function_response(
-                    name=call.name,
-                    response={
-                        "result": result
-                    },
-                )
-            )
+            response_parts.append(_function_response_part(call.name, result))
 
         contents.append(
             types.Content(
@@ -783,35 +953,139 @@ def _agent_loop(
     )
 
 
+def _duplicate_checkout_result(completed: dict[str, Any]) -> dict[str, Any]:
+    """Stop a second checkout in the same turn from reporting an empty cart."""
+    return {
+        "success": False,
+        "status": "already_completed",
+        "order_id": completed.get("order_id"),
+        "message": (
+            "Checkout already completed for this request. Report the "
+            "completed order; do not call checkout again."
+        ),
+        "completed_order": completed,
+    }
+
+
+def _complete(
+    session_id: str,
+    text: str,
+    contents: list[types.Content],
+    usage: TurnUsage,
+    fallback: bool = False,
+) -> dict:
+    tracer.record_event(
+        session_id,
+        "Agent produced final response",
+        details={
+            "response_preview": text[:500],
+            "deterministic_fallback": fallback,
+        },
+        step_type="final_response",
+    )
+
+    return {
+        "status": "complete",
+        "text": text,
+        "messages": contents,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+    }
+
+
+_MODEL_ERROR_REPLY = (
+    "I couldn't complete that request because the AI model returned an "
+    "error. Your cart and conversation are unchanged. Please try again."
+)
+
+
+def _error_result(
+    session_id: str,
+    exc: Exception,
+    contents: list[types.Content],
+    usage: TurnUsage,
+    text: str = _MODEL_ERROR_REPLY,
+) -> dict:
+    logger.exception("Agent turn failed for session %s", session_id)
+    tracer.record_event(
+        session_id,
+        "Agent turn failed; conversation state rolled back",
+        details={"error_type": type(exc).__name__, "error": str(exc)[:500]},
+        step_type="error",
+    )
+    return {
+        "status": "error",
+        "text": text,
+        "messages": contents,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "error": type(exc).__name__,
+    }
+
+
 def run_turn(
     session_id: str,
     model: str,
     conversation: list[types.Content],
 ) -> dict:
-    preplanned = _preplan_bundle(
-        session_id,
-        _latest_user_text(
-            conversation
-        ),
-    )
+    """
+    Run one user turn.
 
-    if preplanned:
-        conversation.append(
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_text(
-                        text=preplanned
-                    )
-                ],
-            )
+    On any failure the conversation is truncated back to its length at entry,
+    so a failed Gemini call can never leave a malformed message behind for
+    the next request.
+    """
+    snapshot = len(conversation)
+    usage = TurnUsage()
+
+    try:
+        preplanned = _preplan_bundle(
+            session_id,
+            _latest_user_text(
+                conversation
+            ),
         )
 
-    return _agent_loop(
-        session_id,
-        model,
-        conversation,
-    )
+        if preplanned:
+            conversation.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(
+                            text=preplanned
+                        )
+                    ],
+                )
+            )
+
+        return _agent_loop(
+            session_id,
+            model,
+            conversation,
+            usage,
+        )
+    except Exception as exc:
+        del conversation[snapshot:]
+        return _error_result(session_id, exc, conversation, usage)
+
+
+def close_pending_calls(
+    pending_calls: list[dict[str, Any]],
+    reason: str,
+) -> list[types.Part]:
+    """
+    Build function responses for calls left open by an unanswered approval.
+
+    Without these, the history would end with an unanswered function call
+    and Gemini would reject the next request.
+    """
+    return [
+        _function_response_part(
+            call["name"],
+            {"success": False, "status": "not_executed", "error": reason},
+        )
+        for call in pending_calls
+    ]
 
 
 def resume_after_approval(
@@ -820,54 +1094,76 @@ def resume_after_approval(
     messages: list[types.Content],
     function_name: str,
     approved: bool,
+    pending_calls: list[dict[str, Any]] | None = None,
 ) -> dict:
-    if approved:
-        result = _run_tool(
-            session_id,
-            function_name,
-            {},
-        )
+    usage = TurnUsage()
+    state: dict[str, Any] = {}
+    calls = pending_calls or [{"name": function_name, "args": {}}]
+    checkout_result: dict[str, Any] | None = None
+    response_parts = []
 
-        tracer.record_event(
-            session_id,
-            (
-                "Checkout approved "
-                "and executed"
-            ),
-            step_type="approval",
-        )
+    for call in calls:
+        name = call["name"]
+        args = dict(call.get("args") or {})
 
-    else:
-        result = {
-            "success": False,
-            "error": (
-                "Checkout denied. "
-                "Cart preserved."
-            ),
-        }
+        if name != "checkout":
+            result = _run_tool(session_id, name, args)
+        elif approved:
+            result = _run_tool(session_id, name, args)
+            checkout_result = result
+            if result.get("success"):
+                state["completed_checkout"] = result
+            tracer.record_event(
+                session_id,
+                (
+                    "Checkout approved "
+                    "and executed"
+                ),
+                step_type="approval",
+            )
+        else:
+            result = {
+                "success": False,
+                "error": (
+                    "Checkout denied. "
+                    "Cart preserved."
+                ),
+            }
+            checkout_result = result
+            tracer.record_event(
+                session_id,
+                "Checkout denied",
+                step_type="approval",
+            )
 
-        tracer.record_event(
-            session_id,
-            "Checkout denied",
-            step_type="approval",
-        )
+        response_parts.append(_function_response_part(name, result))
 
     messages.append(
         types.Content(
             role="user",
-            parts=[
-                types.Part.from_function_response(
-                    name=function_name,
-                    response={
-                        "result": result
-                    },
-                )
-            ],
+            parts=response_parts,
         )
     )
+    snapshot = len(messages)
 
-    return _agent_loop(
-        session_id,
-        model,
-        messages,
-    )
+    try:
+        return _agent_loop(
+            session_id,
+            model,
+            messages,
+            usage,
+            state,
+        )
+    except Exception as exc:
+        # The checkout decision is already final in the database, so report
+        # it deterministically and close the turn with a model message.
+        del messages[snapshot:]
+        text = (
+            _format_checkout(checkout_result)
+            if checkout_result is not None
+            else _MODEL_ERROR_REPLY
+        )
+        messages.append(
+            types.Content(role="model", parts=[types.Part.from_text(text=text)])
+        )
+        return _error_result(session_id, exc, messages, usage, text=text)
