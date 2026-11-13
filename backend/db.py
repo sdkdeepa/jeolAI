@@ -366,6 +366,11 @@ def update_cart(
     action: str = "add",
     size: str | None = None,
 ) -> dict[str, Any]:
+    # A blank or whitespace size from the model counts as "not provided", so it
+    # gets the needs_input prompt instead of an "invalid size" error.
+    if isinstance(size, str):
+        size = size.strip() or None
+
     p = resolve_product(product_name)
 
     if not p:

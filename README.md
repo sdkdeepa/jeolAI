@@ -125,6 +125,31 @@ Gemini does not access the database directly. It may request only declared tools
 
 Thresholds, model names, and estimated token rates are configurable through environment variables.
 
+### Gemini models
+
+| Role | Model | Used when | Estimated rate (USD per 1M tokens, input / output) |
+|---|---|---|---|
+| Default | `gemini-3.5-flash-lite` | All requests unless escalation applies; always used in the downgraded and gated tiers | $0.30 / $2.50 |
+| Escalation | `gemini-3.5-flash` | Only when escalation is requested and the session is in the normal tier | $1.50 / $9.00 |
+
+Rates are Vertex AI Standard pay-as-you-go prices for the global endpoint
+(`GOOGLE_CLOUD_LOCATION=global`). Regional endpoints cost more. Output rates
+include thinking tokens, and JeolAI counts `thoughts_token_count` as output
+when estimating cost. Check current Google Cloud pricing before relying on
+these numbers.
+
+```dotenv
+GEMINI_DEFAULT_MODEL=gemini-3.5-flash-lite
+GEMINI_ESCALATION_MODEL=gemini-3.5-flash
+GEMINI_DEFAULT_INPUT_USD_PER_M=0.30
+GEMINI_DEFAULT_OUTPUT_USD_PER_M=2.50
+GEMINI_ESCALATION_INPUT_USD_PER_M=1.50
+GEMINI_ESCALATION_OUTPUT_USD_PER_M=9.00
+```
+
+`GET /health` lists the active models and any setting that fell back to a
+code default instead of `.env`.
+
 This policy is intentionally simple enough for a workshop while still illustrating a broader production pattern: cost governance belongs in application logic, not only in billing dashboards.
 
 ---
@@ -169,7 +194,7 @@ This policy is intentionally simple enough for a workshop while still illustrati
 |---|---|
 | Frontend | React, Vite |
 | Backend | Python, FastAPI, Pydantic |
-| Model platform | Gemini on Vertex AI |
+| Model platform | Gemini 3.5 Flash-Lite and Gemini 3.5 Flash on Vertex AI |
 | Persistence | SQLite |
 | Testing | Pytest, Playwright |
 | CI and security | GitHub Actions, Ruff, pip-audit, Dependabot |
@@ -184,7 +209,7 @@ This policy is intentionally simple enough for a workshop while still illustrati
 - Google Cloud CLI
 - A Google Cloud project with billing enabled
 - Vertex AI API enabled
-- Permission to invoke the configured Gemini models
+- Permission to invoke `gemini-3.5-flash-lite` and `gemini-3.5-flash`
 
 ---
 
@@ -417,4 +442,4 @@ Workshop-specific instructions can live separately from this engineering overvie
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
